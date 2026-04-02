@@ -1,0 +1,12 @@
+{
+  "name": "Splash Engine V5",
+  "version": "1.0.0",
+  "release_date": "2026-04-02",
+  "entry": "index.html",
+  "notes": [
+    "CSV-safe multiline import handling",
+    "Original Only mode preserves exact mapped prompt",
+    "Randomizer rebuilds Shot 1 in fixed structured order",
+    "Shot 2-10 remain fixed from prompt library"
+  ]
+}
