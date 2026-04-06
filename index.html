@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>Splash Engine V5 – Uploaded PromptRows Only</title>
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <link rel="preconnect" href="https://fonts.googleapis.com">
 <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
 <link href="https://fonts.googleapis.com/css2?family=Playfair+Display:wght@700;900&family=DM+Sans:wght@300;400;500;600;700&family=DM+Mono:wght@400;500&display=swap" rel="stylesheet">
@@ -114,7 +115,7 @@ th{background:var(--cream2);font-size:10px;text-transform:uppercase;letter-spaci
 <body>
 
 <header class="masthead">
-  <div><span class="wordmark">Splash Engine</span><span class="badge">V5 CSV</span></div>
+  <div><span class="wordmark">Splash Engine</span><span class="badge">V5 CSV</span><span id="syncStatus" class="badge" style="margin-left:8px;background:#eee;color:#666">☁ Connecting…</span></div>
   <nav class="nav">
     <button class="active" data-tab="generator">Generator</button>
     <button data-tab="resources">Resources</button>
@@ -1646,6 +1647,220 @@ const BUILT_IN = {
 let DB = JSON.parse(JSON.stringify(BUILT_IN));
 
 // ============================================================
+//  CLOUD SYNC (Supabase)
+// ============================================================
+const SUPABASE_URL = 'https://ilsuxtvcjijxzxxnpoft.supabase.co';
+const SUPABASE_ANON_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6Imlsc3V4dHZjamlqeHp4eG5wb2Z0Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3NzU0NTk1MDMsImV4cCI6MjA5MTAzNTUwM30.SnqQuAm_DXYNPbVShWOM6MVOzZe_1LRDWVlQonabjPw';
+const CLOUD_TABLE = 'splash_library';
+
+let supa = null;
+let cloudReady = false;
+let suppressRealtime = false; // prevent echo loops when we push our own writes
+
+function setSyncStatus(text, color){
+  const el = document.getElementById('syncStatus');
+  if(!el) return;
+  el.textContent = text;
+  el.style.background = color || '#eee';
+  el.style.color = (color && color !== '#eee') ? '#fff' : '#666';
+}
+
+// Convert a DB entry (as stored in-memory) into a row for the cloud table.
+function entryToRow(resourceType, entry){
+  return {
+    id: entry.id,
+    resource_type: resourceType,
+    identifier: entry.identifier || '',
+    category: entry.category || '',
+    gender: entry.gender || 'Both',
+    age: entry.age || 'Both',
+    enabled: entry.enabled !== false,
+    locked: entry.locked === true,
+    priority: entry.priority || 'Normal',
+    prompt: entry.prompt || '',
+    shots: entry.shots || null,
+    updated_at: new Date().toISOString()
+  };
+}
+
+// Convert a cloud row back into an in-memory DB entry.
+function rowToEntry(row){
+  const entry = {
+    id: row.id,
+    identifier: row.identifier || '',
+    category: row.category || '',
+    gender: row.gender || 'Both',
+    age: row.age || 'Both',
+    enabled: row.enabled !== false,
+    locked: row.locked === true,
+    priority: row.priority || 'Normal',
+    prompt: row.prompt || ''
+  };
+  if(row.shots) entry.shots = row.shots;
+  return entry;
+}
+
+// Rebuild the in-memory DB from a flat array of cloud rows.
+function rebuildDBFromRows(rows){
+  const next = {};
+  RESOURCE_TYPES.forEach(t => next[t.key] = []);
+  rows.forEach(row => {
+    const rt = row.resource_type;
+    if(!next[rt]) next[rt] = [];
+    next[rt].push(rowToEntry(row));
+  });
+  DB = next;
+}
+
+// Push every built-in entry to the cloud as the initial seed.
+async function seedBuiltInToCloud(){
+  const allRows = [];
+  RESOURCE_TYPES.forEach(t => {
+    (BUILT_IN[t.key] || []).forEach(entry => {
+      allRows.push(entryToRow(t.key, entry));
+    });
+  });
+  if(!allRows.length) return;
+  // Supabase has per-request row limits, so chunk the seed.
+  const CHUNK = 500;
+  for(let i = 0; i < allRows.length; i += CHUNK){
+    const chunk = allRows.slice(i, i + CHUNK);
+    const { error } = await supa.from(CLOUD_TABLE).insert(chunk);
+    if(error){ console.error('Seed chunk failed:', error); throw error; }
+  }
+}
+
+// Push a single entry (insert or update) to the cloud.
+async function cloudUpsert(resourceType, entry){
+  if(!cloudReady) return;
+  suppressRealtime = true;
+  try {
+    const { error } = await supa.from(CLOUD_TABLE).upsert(entryToRow(resourceType, entry));
+    if(error) console.error('Cloud upsert failed:', error);
+  } finally {
+    setTimeout(() => { suppressRealtime = false; }, 300);
+  }
+}
+
+// Delete a single entry from the cloud by id.
+async function cloudDelete(id){
+  if(!cloudReady) return;
+  suppressRealtime = true;
+  try {
+    const { error } = await supa.from(CLOUD_TABLE).delete().eq('id', id);
+    if(error) console.error('Cloud delete failed:', error);
+  } finally {
+    setTimeout(() => { suppressRealtime = false; }, 300);
+  }
+}
+
+// Replace every row for a given resource_type (used by Replace imports and Reset).
+async function cloudReplaceType(resourceType, entries){
+  if(!cloudReady) return;
+  suppressRealtime = true;
+  try {
+    const del = await supa.from(CLOUD_TABLE).delete().eq('resource_type', resourceType);
+    if(del.error){ console.error('Cloud replace delete failed:', del.error); return; }
+    if(entries.length){
+      const rows = entries.map(e => entryToRow(resourceType, e));
+      const CHUNK = 500;
+      for(let i = 0; i < rows.length; i += CHUNK){
+        const chunk = rows.slice(i, i + CHUNK);
+        const ins = await supa.from(CLOUD_TABLE).insert(chunk);
+        if(ins.error){ console.error('Cloud replace insert failed:', ins.error); return; }
+      }
+    }
+  } finally {
+    setTimeout(() => { suppressRealtime = false; }, 500);
+  }
+}
+
+// Bulk append (used by Append imports).
+async function cloudBulkInsert(resourceType, entries){
+  if(!cloudReady || !entries.length) return;
+  suppressRealtime = true;
+  try {
+    const rows = entries.map(e => entryToRow(resourceType, e));
+    const CHUNK = 500;
+    for(let i = 0; i < rows.length; i += CHUNK){
+      const chunk = rows.slice(i, i + CHUNK);
+      const { error } = await supa.from(CLOUD_TABLE).insert(chunk);
+      if(error){ console.error('Cloud bulk insert failed:', error); return; }
+    }
+  } finally {
+    setTimeout(() => { suppressRealtime = false; }, 500);
+  }
+}
+
+// Subscribe to realtime changes so edits from other users appear instantly.
+function subscribeRealtime(){
+  supa.channel('splash_library_changes')
+    .on('postgres_changes', { event: '*', schema: 'public', table: CLOUD_TABLE }, async () => {
+      if(suppressRealtime) return;
+      // Reload everything on any change — simple and robust for this data size.
+      const { data, error } = await supa.from(CLOUD_TABLE).select('*');
+      if(error){ console.error('Realtime reload failed:', error); return; }
+      rebuildDBFromRows(data || []);
+      // Re-render whatever the user is currently viewing.
+      try { renderResTable(); } catch(e){}
+      try { buildAllPools(); } catch(e){}
+      try { refreshCategorySelect(); } catch(e){}
+      setSyncStatus('☁ Synced', '#2a9d5f');
+      setTimeout(() => { if(cloudReady) setSyncStatus('☁ Live', '#2a9d5f'); }, 800);
+    })
+    .subscribe();
+}
+
+// Main connect routine called at boot.
+async function initCloudSync(){
+  try {
+    if(typeof supabase === 'undefined'){
+      setSyncStatus('☁ Offline', '#c33');
+      console.warn('Supabase client library failed to load.');
+      return false;
+    }
+    supa = supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+
+    // Check if the table is empty — if so, seed it with built-ins.
+    const { data: existing, error: countErr } = await supa
+      .from(CLOUD_TABLE).select('id', { count: 'exact', head: false }).limit(1);
+    if(countErr){
+      console.error('Cloud read failed:', countErr);
+      setSyncStatus('☁ Offline', '#c33');
+      return false;
+    }
+
+    if(!existing || existing.length === 0){
+      setSyncStatus('☁ Seeding…', '#e89f00');
+      cloudReady = true;
+      await seedBuiltInToCloud();
+    }
+
+    // Load everything from the cloud.
+    cloudReady = true;
+    const { data: allRows, error: loadErr } = await supa.from(CLOUD_TABLE).select('*');
+    if(loadErr){
+      console.error('Cloud load failed:', loadErr);
+      setSyncStatus('☁ Offline', '#c33');
+      cloudReady = false;
+      return false;
+    }
+    if(allRows && allRows.length){
+      rebuildDBFromRows(allRows);
+    }
+
+    subscribeRealtime();
+    setSyncStatus('☁ Live', '#2a9d5f');
+    return true;
+  } catch(err) {
+    console.error('Cloud init threw:', err);
+    setSyncStatus('☁ Offline', '#c33');
+    cloudReady = false;
+    return false;
+  }
+}
+
+// ============================================================
 //  UTILITY
 // ============================================================
 function rand(arr){ return arr[Math.floor(Math.random()*arr.length)]; }
@@ -1673,10 +1888,13 @@ let state = {
 // ============================================================
 //  BOOT
 // ============================================================
-document.addEventListener('DOMContentLoaded', () => {
+document.addEventListener('DOMContentLoaded', async () => {
   initNav();
   initGeneratorToggles();
   initCategorySelect();
+  // Try to pull data from Supabase before the first render.
+  // If it fails, we fall through to the built-in defaults already in DB.
+  await initCloudSync();
   buildAllPools();
   initResourcesTab();
   initImportTab();
@@ -1794,12 +2012,20 @@ function buildAllPools(){
 function buildPool(key){
   const el = document.getElementById('pool-'+key);
   if(!el) return;
+  // Preserve any existing selections across rebuilds so adding/importing
+  // an entry doesn't wipe what the user already picked.
+  const prevChecked = new Set(
+    [...el.querySelectorAll('input[type=checkbox]:checked')].map(c=>c.dataset.id)
+  );
   const items = getPoolItems(key);
-  el.innerHTML = items.length ? items.map(it=>`
+  el.innerHTML = items.length ? items.map(it=>{
+    const isChecked = prevChecked.has(it.id) ? ' checked' : '';
+    return `
     <label>
-      <input class="chk" type="checkbox" data-pool="${key}" data-id="${esc(it.id)}" checked>
+      <input class="chk" type="checkbox" data-pool="${key}" data-id="${esc(it.id)}"${isChecked}>
       ${esc(it.identifier||it.prompt||'')}
-    </label>`).join('') : '<span class="small">No entries — add in Resources or Import.</span>';
+    </label>`;
+  }).join('') : '<span class="small">No entries — add in Resources or Import.</span>';
   el.querySelectorAll('input[type=checkbox]').forEach(cb=>{
     cb.addEventListener('change', ()=>updateCount(key));
   });
@@ -1852,8 +2078,7 @@ function validate(){
     });
   }
   if(state.styling==='On'){
-    const hasAnyAcc = ['earrings','jewellery','bags','sunglasses','hairacc','belts'].some(k=>getChecked(k).length>0);
-    if(!hasAnyAcc) errors.push('At least one Accessory (styling is On)');
+    // Accessories are optional — only footwear is required when styling is On.
     if(getChecked('footwear').length===0) errors.push('Footwear (minimum 1 required)');
   }
   return errors;
@@ -1935,6 +2160,12 @@ function prepareBasePrompt(text){
   return t;
 }
 function safeIdText(obj){
+  // Full prompt text — used inside the generated Shot 1 prompt body.
+  // Falls back to identifier only if no prompt is authored.
+  return obj ? (obj.prompt || obj.identifier || '') : '';
+}
+function safeIdLabel(obj){
+  // Short identifier label — used in the card summary chips shown in the UI.
   return obj ? (obj.identifier || obj.prompt || '') : '';
 }
 
@@ -1970,7 +2201,7 @@ function buildCard(varNum, libRow){
   const stylingItems = [];
   if(state.styling==='On'){
     [picks.earring, picks.jewel, picks.bag, picks.sg, picks.ha, picks.belt].forEach(x => {
-      if(x) stylingItems.push(safeIdText(x));
+      if(x) stylingItems.push(safeIdLabel(x));
     });
   }
 
@@ -1980,13 +2211,13 @@ function buildCard(varNum, libRow){
     age: state.age,
     category: document.getElementById('categorySelect').value,
     row: libRow ? libRow.identifier : 'No library row',
-    model: state.mode==='Randomizer' ? safeIdText(picks.model) : '',
-    hair: state.mode==='Randomizer' ? safeIdText(picks.hair) : '',
-    makeup: state.mode==='Randomizer' ? safeIdText(picks.makeup) : '',
-    pose: state.mode==='Randomizer' ? safeIdText(picks.behavior) : '',
-    environment: state.mode==='Randomizer' ? safeIdText(picks.background) : '',
+    model: state.mode==='Randomizer' ? safeIdLabel(picks.model) : '',
+    hair: state.mode==='Randomizer' ? safeIdLabel(picks.hair) : '',
+    makeup: state.mode==='Randomizer' ? safeIdLabel(picks.makeup) : '',
+    pose: state.mode==='Randomizer' ? safeIdLabel(picks.behavior) : '',
+    environment: state.mode==='Randomizer' ? safeIdLabel(picks.background) : '',
     styling: state.styling==='On' ? stylingItems.join(', ') : '',
-    footwear: state.styling==='On' && picks.fw ? safeIdText(picks.fw) : '',
+    footwear: state.styling==='On' && picks.fw ? safeIdLabel(picks.fw) : '',
     shots
   };
 }
@@ -2301,9 +2532,18 @@ function saveModal(){
     if(idx>-1) DB[typeKey][idx]=entry;
   }
 
+  // Push the new/edited entry to the cloud so other users see it.
+  cloudUpsert(typeKey, entry);
+
   closeModal();
+  // Switch the Resources filter to the type we just saved so the user
+  // immediately sees the new/edited row instead of a stale filtered view.
+  const resTypeSel = document.getElementById('resType');
+  if(resTypeSel && resTypeSel.value !== typeKey){
+    resTypeSel.value = typeKey;
+  }
   renderResTable();
-  buildPool(typeKey);
+  buildAllPools();
   refreshCategorySelect();
 }
 
@@ -2311,9 +2551,11 @@ function deleteModal(){
   const {typeKey, rowId} = _editCtx;
   if(!confirm('Delete this entry?')) return;
   DB[typeKey] = (DB[typeKey]||[]).filter(r=>r.id!==rowId);
+  // Remove from cloud as well.
+  cloudDelete(rowId);
   closeModal();
   renderResTable();
-  buildPool(typeKey);
+  buildAllPools();
   refreshCategorySelect();
 }
 
@@ -2469,12 +2711,24 @@ function doImport(){
     return entry;
   });
 
-  if(mode==='Replace') DB[key]=imported;
-  else DB[key]=[...(DB[key]||[]),...imported];
+  if(mode==='Replace'){
+    DB[key]=imported;
+    cloudReplaceType(key, imported);
+  } else {
+    DB[key]=[...(DB[key]||[]),...imported];
+    cloudBulkInsert(key, imported);
+  }
 
-  status.textContent = `✅ Imported ${imported.length} rows into "${RESOURCE_TYPES.find(t=>t.key===key).label}" (${mode}).`;
+  const label = RESOURCE_TYPES.find(t=>t.key===key).label;
+  status.textContent = `✅ Imported ${imported.length} rows into "${label}" (${mode}). View switched to "${label}" in Resources.`;
+  // Switch the Resources filter to the imported type so the user sees the
+  // rows immediately instead of whatever type was previously filtered.
+  const resTypeSel = document.getElementById('resType');
+  if(resTypeSel && resTypeSel.value !== key){
+    resTypeSel.value = key;
+  }
   renderResTable();
-  buildPool(key);
+  buildAllPools();
   refreshCategorySelect();
 }
 
@@ -2482,9 +2736,15 @@ function resetSelected(){
   const key = document.getElementById('importType').value;
   if(!confirm(`Reset "${key}" to built-in defaults? This cannot be undone.`)) return;
   DB[key] = JSON.parse(JSON.stringify(BUILT_IN[key]||[]));
+  // Replace the cloud copy of this resource type with the built-in defaults.
+  cloudReplaceType(key, DB[key]);
   document.getElementById('importStatus').textContent = `✅ "${key}" reset to built-in defaults.`;
+  const resTypeSel = document.getElementById('resType');
+  if(resTypeSel && resTypeSel.value !== key){
+    resTypeSel.value = key;
+  }
   renderResTable();
-  buildPool(key);
+  buildAllPools();
   refreshCategorySelect();
 }
 
