@@ -1715,17 +1715,27 @@ function rebuildDBFromRows(rows){
 // Push every built-in entry to the cloud as the initial seed.
 async function seedBuiltInToCloud(){
   const allRows = [];
+  const seenIds = new Set();
   RESOURCE_TYPES.forEach(t => {
-    (BUILT_IN[t.key] || []).forEach(entry => {
-      allRows.push(entryToRow(t.key, entry));
+    (BUILT_IN[t.key] || []).forEach((entry, idx) => {
+      // Defensive: make sure every seeded row has a unique id. Built-in data
+      // may share ids across resource types or be missing an id entirely.
+      let safeId = entry.id || `${t.key}_seed_${idx}`;
+      if(seenIds.has(safeId)){
+        safeId = `${t.key}_${safeId}_${idx}`;
+      }
+      seenIds.add(safeId);
+      const row = entryToRow(t.key, { ...entry, id: safeId });
+      allRows.push(row);
     });
   });
   if(!allRows.length) return;
-  // Supabase has per-request row limits, so chunk the seed.
-  const CHUNK = 500;
+  // Use upsert so a re-run of the seed is idempotent and duplicate ids don't
+  // trigger a 409 conflict.
+  const CHUNK = 200;
   for(let i = 0; i < allRows.length; i += CHUNK){
     const chunk = allRows.slice(i, i + CHUNK);
-    const { error } = await supa.from(CLOUD_TABLE).insert(chunk);
+    const { error } = await supa.from(CLOUD_TABLE).upsert(chunk, { onConflict: 'id' });
     if(error){ console.error('Seed chunk failed:', error); throw error; }
   }
 }
